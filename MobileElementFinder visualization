@@ -1,0 +1,145 @@
+# ============================================================
+# MobileElementFinder visualization (final refined version)
+# ============================================================
+
+library(tidyverse)
+library(reshape2)
+library(patchwork)
+
+# -------------------------
+# 1. Load input files
+# -------------------------
+mge_summary <- read.delim("mefinder_summary_counts.tsv", sep = "\t", header = TRUE)
+mge_bio <- read.delim("mefinder_MGE_biological_summary.tsv", sep="\t", header=TRUE)
+gtdb <- read.delim("gtdbtk.bac120.summary.tsv", sep="\t", header=TRUE)
+
+# -------------------------
+# 2. Parse GTDB taxonomy
+# -------------------------
+gtdb_parsed <- gtdb %>%
+  select(user_genome, classification) %>%
+  separate(classification, into = c("d","p","c","o","f","g","s"),
+           sep = ";", fill = "right", remove = FALSE) %>%
+  mutate(
+    genus = ifelse(!is.na(g) & g != "", str_remove(g, "g__"), "Unclassified"),
+    species = ifelse(!is.na(s) & s != "", str_remove(s, "s__"), genus),
+    taxonomy_label = ifelse(species == "" | is.na(species), genus, species)
+  ) %>%
+  select(user_genome, taxonomy_label)
+
+# -------------------------
+# 3. Merge taxonomy with MGE outputs
+# -------------------------
+mge_summary <- mge_summary %>%
+  left_join(gtdb_parsed, by = c("sample_id" = "user_genome"))
+
+mge_bio <- mge_bio %>%
+  left_join(gtdb_parsed, by = c("sample_id" = "user_genome"))
+
+# -------------------------
+# 4. Bar plot of MGE types per taxonomy
+# -------------------------
+p1 <- ggplot(mge_summary, aes(x = taxonomy_label, y = count, fill = type)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      vjust = 1,
+      hjust = 1,
+      size = 8,
+      margin = margin(t = 2)
+    ),
+    legend.position = "right",
+    legend.margin = margin(0, 0, 0, 0, "cm"),
+    legend.box.margin = margin(0, 0, 0, 0, "cm"),
+    plot.margin = margin(5, 5, 5, 5, "pt")
+  ) +
+  labs(
+    title = "Distribution of MGE Types per Genome",
+    x = NULL, y = "Count", fill = "MGE Type"
+  )
+
+ggsave("mefinder_MGE_types_barplot_taxonomy_final.png", p1, width = 14, height = 6, dpi = 300)
+
+# -------------------------
+# 5. Heatmap of MGE types across genomes
+# -------------------------
+heatmap_data <- mge_summary %>%
+  dcast(taxonomy_label ~ type, value.var = "count", fun.aggregate = sum)
+write.table(heatmap_data, "mefinder_MGE_types_matrix_taxonomy.tsv", sep="\t", row.names=FALSE, quote=FALSE)
+heatmap_melt <- melt(heatmap_data, id.vars = "taxonomy_label")
+
+p2 <- ggplot(heatmap_melt, aes(x = variable, y = taxonomy_label, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "white", high = "darkred") +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+    axis.text.y = element_text(size = 8),
+    legend.position = "right",
+    legend.margin = margin(0, 0, 0, 0, "cm"),
+    plot.margin = margin(5, 5, 5, 5, "pt")
+  ) +
+  labs(
+    title = "Heatmap of MGE Types Across Genomes",
+    x = NULL, y = NULL, fill = "Count"
+  )
+
+ggsave("mefinder_MGE_types_heatmap_taxonomy_final.png", p2, width = 9, height = 7, dpi = 300)
+
+# -------------------------
+# 6. Biological summary (Top 15 MGEs)
+# -------------------------
+top_mges <- mge_bio %>%
+  group_by(name) %>%
+  summarise(total = sum(count)) %>%
+  arrange(desc(total)) %>%
+  slice_head(n = 15)
+
+p3 <- ggplot(top_mges, aes(x = reorder(name, -total), y = total, fill = name)) +
+  geom_bar(stat="identity") +
+  labs(title = "Top 15 Most Frequent MGEs",
+       x = NULL, y = "Total Count") +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    legend.position = "none",
+    plot.margin = margin(5, 5, 5, 5, "pt")
+  )
+
+ggsave("mefinder_MGE_top15_taxonomy_final.png", p3, width = 8, height = 5, dpi = 300)
+
+# -------------------------
+# 7. Faceted panel by MGE type (4 combined plots)
+# -------------------------
+plot_mge_type <- function(data, mge_type) {
+  ggplot(data %>% filter(type == mge_type),
+         aes(x = taxonomy_label, y = count, fill = name)) +
+    geom_bar(stat = "identity", position = "stack") +
+    labs(title = paste("Mobile Genetic Elements:", mge_type),
+         x = NULL, y = "Count", fill = mge_type) +
+    theme_bw(base_size = 11) +
+    theme(
+      axis.text.x = element_text(
+        angle = 45,
+        vjust = 1,
+        hjust = 1,
+        size = 6,
+        margin = margin(t = 2)
+      ),
+      legend.position = "right",
+      legend.margin = margin(0, 0, 0, 0, "cm"),
+      plot.margin = margin(3, 3, 3, 3, "pt")
+    )
+}
+
+pA <- plot_mge_type(mge_bio, "insertion sequence")
+pB <- plot_mge_type(mge_bio, "mite")
+pC <- plot_mge_type(mge_bio, "composite transposon")
+pD <- plot_mge_type(mge_bio, "unit transposon")
+
+combined <- pA / (pB | pC | pD)
+combined <- combined + plot_layout(heights = c(2, 1))
+
+ggsave("MGE_types_panel_weighted_taxonomy_final.png", combined, width = 16, height = 11, dpi = 300)
