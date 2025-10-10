@@ -1,0 +1,179 @@
+# Load required libraries
+library(tidyverse)
+library(igraph)
+library(openxlsx)
+library(ggraph)
+library(ggrepel)
+library(viridis)
+library(scales)
+library(patchwork)
+
+# Step 1: Load and clean AMR matrix
+amr_raw <- read.delim("amr_symbol_class_presence_matrix.tsv", check.names = FALSE)
+
+amr_cleaned <- amr_raw %>%
+  filter(!GeneSymbol %in% c("Gene symbol", "GeneSymbol", "", NA))
+
+rownames(amr_cleaned) <- amr_cleaned$GeneSymbol
+amr_matrix <- amr_cleaned[, !(colnames(amr_cleaned) %in% c("GeneSymbol", "Class", "Subclass"))]
+amr_matrix <- amr_matrix %>% mutate(across(everything(), ~ as.numeric(.)))
+amr_matrix <- amr_matrix[rowSums(amr_matrix, na.rm = TRUE) > 0, ]
+write.table(amr_matrix, "amr_gene_only_presence_matrix.tsv", sep = "\t", quote = FALSE, col.names = NA)
+
+# Step 2: Load taxonomy
+tax <- read.delim("taxonomy_cleaned.tsv")
+
+# Step 3: Match MAGs and reshape
+shared_mags <- intersect(colnames(amr_matrix), tax$MAG_ID)
+amr <- amr_matrix[, shared_mags, drop = FALSE]
+tax <- tax[tax$MAG_ID %in% shared_mags, ]
+
+# Identify sample origins
+dust_samples <- shared_mags[grepl("dust", shared_mags, ignore.case = TRUE)]
+litter_samples <- shared_mags[grepl("litter", shared_mags, ignore.case = TRUE)]
+
+amr_long <- amr %>%
+  rownames_to_column("Gene") %>%
+  pivot_longer(-Gene, names_to = "MAG_ID", values_to = "Present") %>%
+  filter(Present == 1) %>%
+  mutate(Origin = case_when(
+    grepl("dust", MAG_ID, ignore.case = TRUE) ~ "Dust",
+    grepl("litter", MAG_ID, ignore.case = TRUE) ~ "Litter",
+    TRUE ~ "Other"
+  ))
+
+merged <- left_join(amr_long, tax[, c("MAG_ID", "Genus")], by = "MAG_ID") %>%
+  filter(!is.na(Genus) & Genus != "")
+
+create_sample_network <- function(sample_data, sample_type, n_genes = NULL, n_genera = NULL, min_weight = 1) {
+  # Remove rows with NA or empty Gene or Genus
+  sample_data <- sample_data %>%
+    filter(!is.na(Gene) & Gene != "", !is.na(Genus) & Genus != "")
+  
+  # If n_genes or n_genera is NULL, use all available
+  if (is.null(n_genes)) {
+    top_genes <- sample_data %>% count(Gene, sort = TRUE) %>% pull(Gene)
+  } else {
+    top_genes <- sample_data %>% count(Gene, sort = TRUE) %>% slice_head(n = n_genes) %>% pull(Gene)
+  }
+  
+  if (is.null(n_genera)) {
+    top_genera <- sample_data %>% count(Genus, sort = TRUE) %>% pull(Genus)
+  } else {
+    top_genera <- sample_data %>% count(Genus, sort = TRUE) %>% slice_head(n = n_genera) %>% pull(Genus)
+  }
+  
+  # Filter merged dataset
+  merged_final <- sample_data %>%
+    filter(Gene %in% top_genes & Genus %in% top_genera)
+  
+  # Create edge list
+  edges <- merged_final %>%
+    mutate(GeneID = paste0("GENE:", Gene),
+           GenusID = paste0("GENUS:", Genus)) %>%
+    group_by(GeneID, GenusID) %>%
+    summarise(weight = n(), .groups = "drop") %>%
+    rename(from = GeneID, to = GenusID) %>%
+    arrange(desc(weight))
+  
+  if (nrow(edges) < 1) {
+    cat(paste("⚠️ No edges found for", sample_type, "samples. Skipping.\n"))
+    return(NULL)
+  }
+  
+  # Create gene nodes
+  gene_nodes <- merged_final %>%
+    filter(Gene %in% top_genes) %>%
+    count(Gene, name = "frequency") %>%
+    mutate(
+      id = paste0("GENE:", Gene),
+      type = "Gene",
+      label = Gene,
+      degree = 0
+    ) %>%
+    rename(size_metric = frequency) %>%
+    select(id, type, size_metric, label, degree)
+  
+  # Create genus nodes
+  genus_nodes <- merged_final %>%
+    filter(Genus %in% top_genera) %>%
+    count(Genus, name = "frequency") %>%
+    mutate(
+      id = paste0("GENUS:", Genus),
+      type = "Genus",
+      label = Genus,
+      degree = 0
+    ) %>%
+    rename(size_metric = frequency) %>%
+    select(id, type, size_metric, label, degree)
+  
+  nodes <- bind_rows(gene_nodes, genus_nodes)
+  
+  # Create graph
+  g <- graph_from_data_frame(edges, vertices = nodes, directed = FALSE)
+  
+  # Add degree info
+  V(g)$degree <- degree(g)
+  nodes$degree <- V(g)$degree[match(nodes$id, V(g)$name)]
+  
+  # Add styling
+  V(g)$color <- ifelse(V(g)$type == "Gene", "#E74C3C", "#2E86AB")
+  V(g)$size <- rescale(V(g)$degree, to = c(4, 20))
+  V(g)$alpha <- 0.8
+  E(g)$width <- rescale(E(g)$weight, to = c(0.5, 5))
+  E(g)$color <- "gray60"
+  E(g)$alpha <- rescale(E(g)$weight, to = c(0.3, 0.8))
+  
+  return(list(graph = g, edges = edges, nodes = nodes, merged_data = merged_final))
+}
+
+
+# Function to plot network with layout option and clear text visibility
+create_network_plot <- function(network_data, sample_type, layout_type = "nicely", color_gene = "#C70039", color_genus = "#1B4F72") {
+  if (is.null(network_data)) return(NULL)
+  g <- network_data$graph
+  
+  set.seed(42)
+  p <- ggraph(g, layout = layout_type) +
+    geom_edge_link(aes(width = weight, alpha = weight), color = "gray50", show.legend = FALSE) +
+    geom_node_point(aes(size = degree, color = type), stroke = 0.8, alpha = 0.7) +
+    geom_node_text(aes(label = label), 
+                   size = 3.5, 
+                   fontface = "bold", 
+                   color = "black",
+                   bg.colour = "white",
+                   bg.r = 0.1,
+                   repel = TRUE,
+                   max.overlaps = Inf) +
+    scale_color_manual(values = c("Gene" = color_gene, "Genus" = color_genus)) +
+    scale_size_continuous(range = c(3, 15)) +
+    theme_graph(base_family = "") +
+    theme(legend.position = "bottom",
+          plot.background = element_rect(fill = "white", color = NA),
+          panel.background = element_rect(fill = "white", color = NA)) +
+    labs(title = paste("AMR Gene–Genus Network:", sample_type, "-", layout_type, "layout"),
+         subtitle = paste(vcount(g), "nodes,", ecount(g), "edges"))
+  return(p)
+}
+
+# Separate datasets
+dust_data <- merged %>% filter(Origin == "Dust")
+litter_data <- merged %>% filter(Origin == "Litter")
+
+# Generate networks with ALL genes and genera (set to NULL to include all)
+dust_network <- create_sample_network(dust_data, "Dust", n_genes = NULL, n_genera = NULL, min_weight = 1)
+litter_network <- create_sample_network(litter_data, "Litter", n_genes = NULL, n_genera = NULL, min_weight = 1)
+
+# Generate layout variants
+layouts <- c("nicely", "fr", "circle")
+
+for (layout in layouts) {
+  if (!is.null(dust_network)) {
+    p <- create_network_plot(dust_network, "Dust", layout_type = layout)
+    ggsave(paste0("dust_network_", layout, ".png"), p, width = 14, height = 10, dpi = 300, bg = "white")
+  }
+  if (!is.null(litter_network)) {
+    p <- create_network_plot(litter_network, "Litter", layout_type = layout)
+    ggsave(paste0("litter_network_", layout, ".png"), p, width = 14, height = 10, dpi = 300, bg = "white")
+  }
+}
