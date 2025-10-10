@@ -1,0 +1,158 @@
+# ============================================================
+# geNomad plasmid + provirus visualization with taxonomy
+# ============================================================
+
+library(tidyverse)
+library(patchwork)
+
+# -----------------------------
+# 1. Load input files
+# -----------------------------
+plasmids <- read_tsv("genomad_plasmid_summary_merged.tsv")
+prov <- read_tsv("genomad_provirus_summary_merged.tsv")
+gtdb <- read.delim("gtdbtk.bac120.summary.tsv", sep = "\t", header = TRUE)
+
+# -----------------------------
+# 2. Parse GTDB taxonomy (species-level label)
+# -----------------------------
+gtdb_parsed <- gtdb %>%
+  select(user_genome, classification) %>%
+  separate(classification, into = c("d","p","c","o","f","g","s"),
+           sep = ";", fill = "right", remove = FALSE) %>%
+  mutate(
+    genus = ifelse(!is.na(g) & g != "", str_remove(g, "g__"), "Unclassified"),
+    species = ifelse(!is.na(s) & s != "", str_remove(s, "s__"), genus),
+    taxonomy_label = ifelse(species == "" | is.na(species), genus, species)
+  ) %>%
+  select(user_genome, taxonomy_label)
+
+# -----------------------------
+# 3. Merge taxonomy with plasmid + provirus data
+# -----------------------------
+plasmids <- plasmids %>%
+  left_join(gtdb_parsed, by = c("sample_id" = "user_genome"))
+
+prov <- prov %>%
+  left_join(gtdb_parsed, by = c("sample_id" = "user_genome"))
+
+# ============================================================
+# 🧫  PLASMID VISUALIZATION
+# ============================================================
+
+# --- Total plasmids per genome ---
+plasmid_counts <- plasmids %>%
+  group_by(taxonomy_label) %>%
+  summarise(plasmid_count = n(), .groups = "drop")
+
+p_total <- ggplot(plasmid_counts, aes(x = reorder(taxonomy_label, -plasmid_count), y = plasmid_count, fill = taxonomy_label)) +
+  geom_bar(stat = "identity") +
+  theme_bw(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 7),
+    legend.position = "none"
+  ) +
+  labs(
+    title = "Total Plasmids per Genome",
+    x = NULL,
+    y = "Plasmid Count"
+  )
+
+ggsave("plasmid_total_counts_taxonomy.png", p_total, width = 10, height = 5, dpi = 300)
+
+# --- Conjugation genes ---
+conj_sample <- plasmids %>%
+  filter(!is.na(conjugation_genes) & conjugation_genes != "") %>%
+  separate_rows(conjugation_genes, sep = ";|,") %>%
+  mutate(conjugation_genes = trimws(conjugation_genes)) %>%
+  group_by(taxonomy_label, conjugation_genes) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  mutate(category = "Conjugation")
+
+# --- AMR genes ---
+amr_sample <- plasmids %>%
+  filter(!is.na(amr_genes) & amr_genes != "") %>%
+  separate_rows(amr_genes, sep = ";|,") %>%
+  mutate(amr_genes = trimws(amr_genes)) %>%
+  group_by(taxonomy_label, amr_genes) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  mutate(category = "AMR")
+
+# --- Plot 1: Conjugation genes ---
+p_conj <- ggplot(conj_sample, aes(x = taxonomy_label, y = count, fill = conjugation_genes)) +
+  geom_bar(stat = "identity", position = "stack") +
+  theme_bw(base_size = 13) +
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 7),
+    legend.position = "right"
+  ) +
+  labs(
+    title = "Plasmid Conjugation Genes per Genome",
+    x = NULL, y = "Count", fill = "Conjugation Genes"
+  )
+
+# --- Plot 2: AMR genes ---
+p_amr <- ggplot(amr_sample, aes(x = taxonomy_label, y = count, fill = amr_genes)) +
+  geom_bar(stat = "identity", position = "stack") +
+  theme_bw(base_size = 13) +
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 7),
+    legend.position = "right"
+  ) +
+  labs(
+    title = "Plasmid AMR Genes per Genome",
+    x = NULL, y = "Count", fill = "AMR Genes"
+  )
+
+ggsave("plasmid_conjugation_genes_taxonomy.png", p_conj, width = 12, height = 6, dpi = 300)
+ggsave("plasmid_amr_genes_taxonomy.png", p_amr, width = 12, height = 6, dpi = 300)
+
+# ============================================================
+# 🦠  PROVIRUS VISUALIZATION
+# ============================================================
+
+# --- Parse viral taxonomy levels ---
+prov <- prov %>%
+  separate(taxonomy, into = paste0("rank", 1:10), sep = ";", fill = "right", remove = FALSE) %>%
+  mutate(
+    viral_class = rank5,
+    viral_class = ifelse(is.na(viral_class) | viral_class == "", "Unclassified", str_remove(viral_class, "c__"))
+  )
+
+# --- Summarize per genome ---
+prov_summary <- prov %>%
+  group_by(taxonomy_label, viral_class) %>%
+  summarise(count = n(), .groups = "drop")
+
+# --- Total per class ---
+prov_total <- prov_summary %>%
+  group_by(viral_class) %>%
+  summarise(total = sum(count), .groups = "drop")
+
+# --- Plot 1: total by class ---
+p1 <- ggplot(prov_total, aes(x = reorder(viral_class, -total), y = total, fill = viral_class)) +
+  geom_col() +
+  theme_bw(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Total Proviruses by Viral Class", x = "Viral Class", y = "Total Count") +
+  guides(fill = "none")
+
+ggsave("provirus_total_by_class.png", p1, width = 8, height = 5, dpi = 300)
+
+# --- Plot 2: per-genome ---
+p2 <- ggplot(prov_summary, aes(x = taxonomy_label, y = count, fill = viral_class)) +
+  geom_col(position = "stack") +
+  theme_bw(base_size = 13) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+    legend.position = "right"
+  ) +
+  labs(title = "Provirus Counts per Genome", x = NULL, y = "Count", fill = "Viral Class")
+
+ggsave("provirus_counts_per_genome.png", p2, width = 12, height = 6, dpi = 300)
+
+cat("\n✅ Saved plots:\n",
+    "- plasmid_total_counts_taxonomy.png\n",
+    "- plasmid_conjugation_genes_taxonomy.png\n",
+    "- plasmid_amr_genes_taxonomy.png\n",
+    "- provirus_total_by_class.png\n",
+    "- provirus_counts_per_genome.png\n")
