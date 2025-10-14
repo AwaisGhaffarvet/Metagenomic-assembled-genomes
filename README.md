@@ -1,3 +1,14 @@
+# 🧬 Metagenome-Assembled Genomes from Chicken Housing Environments
+### Bioinformatics Analysis Pipeline
+
+This repository contains the complete bioinformatics workflow used for the reconstruction, quality assessment, taxonomic classification, and functional characterization of metagenome-assembled genomes (MAGs) derived from the layer chicken housing environment.
+
+The pipeline integrates assembly, binning, genome quality evaluation, taxonomic assignment, functional and antimicrobial-resistance (AMR) annotation, and data visualization. It enables a detailed understanding of the ecological and functional roles of microbial communities, focusing on antimicrobial resistance, nutrient cycling, and microbial interactions within poultry barn ecosystems.
+
+---
+
+## 🧩 Pipeline Overview
+
 ```mermaid
 flowchart TD
     A[Raw shotgun reads] --> B[Quality Control<br/>FastQC]
@@ -12,3 +23,4 @@ flowchart TD
     J --> K[Correlation & Network Analysis<br/>R igraph and ggraph]
     K --> L[Visualization & Integration<br/>R ggplot2 and pheatmap]
     L --> M[Final Results<br/>MAG taxonomy, functions, ARGs, pathways]
+
