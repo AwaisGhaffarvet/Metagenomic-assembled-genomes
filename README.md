@@ -1,3 +1,4 @@
+```mermaid
 flowchart TD
     A[Raw shotgun reads] --> B[Quality Control<br/>FastQC]
     B --> C[De novo Assembly<br/>MEGAHIT]
