@@ -1,0 +1,481 @@
+## ------------ USER: EDIT THESE ------------
+dust_infile   <- "combined_dust_emapper.tsv"
+litter_infile <- "combined_emapper.tsv"
+tax_file      <- "gtdbtk.bac120.summary.tsv"   # GTDB with BOTH dust + litter MAGs
+out_dir       <- "combined_outputs_new-123"
+## -----------------------------------------
+
+# Packages
+if (!requireNamespace("tidyverse", quietly=TRUE)) install.packages("tidyverse", repos="https://cloud.r-project.org")
+
+suppressPackageStartupMessages(library(tidyverse))
+library(grid)
+
+
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Helpers
+lab_trunc <- function(x, width = 40) stringr::str_trunc(x, width, side="right")
+wrap_x    <- function(x, width = 18) stringr::str_wrap(x, width = width)
+dyn_h     <- function(n) max(5.0, n * 0.12)
+
+# ---------- Load & parse GTDB once ----------
+tax <- readr::read_tsv(tax_file, show_col_types = FALSE)
+stopifnot(all(c("user_genome","classification") %in% names(tax)))
+
+tax_sep <- tidyr::separate_wider_delim(
+  tax, classification, delim = ";",
+  names = c("domain","phylum","class","order","family","genus","species"),
+  too_few = "align_start", too_many = "merge"
+)
+strip_rank <- function(x, prefix) {
+  x <- stringr::str_remove(x, paste0("^", prefix))
+  dplyr::if_else(is.na(x) | x %in% c("", "__", "_"), NA_character_, x)
+}
+tax_clean <- tax_sep %>%
+  mutate(
+    genus   = strip_rank(genus,   "g__"),
+    species = strip_rank(species, "s__")
+  ) %>%
+  transmute(
+    sample = user_genome,
+    tax_label_raw = dplyr::coalesce(species, genus, sample)
+  )
+
+# ---------- KO sets / regex maps (reused) ----------
+KOSETS <- list(
+  "Glycolysis" = c("K00844","K12407","K01810","K01689","K01623","K01803","K01624","K01834","K01835","K01836"),
+  "Entner-Doudoroff" = c("K01690","K11645","K00001","K00844","K01810"),
+  "Pentose phosphate (oxidative)" = c("K00036","K00033","K00948","K01810","K01623"),
+  "TCA cycle" = c("K01647","K01676","K00031","K00134","K00150","K01902","K01847","K01681","K00116","K01679"),
+  "Wood–Ljungdahl (acetyl-CoA)" = c("K00198","K00194","K14138","K14139","K14137","K00197","K14136"),
+  "Beta-oxidation (FA catabolism)" = c("K00074","K01692","K01782","K01026","K00626","K07512"),
+  "Lactate fermentation" = c("K00016","K03777"),
+  "Ethanol fermentation" = c("K00001","K00002","K00003","K04072"),
+  "Propionate (via acrylate/succinate)" = c("K01026","K01847","K00244","K00245"),
+  "Butyrate (acetyl-CoA route)" = c("K00074","K00626","K01034","K00929","K00930","K01834"),
+  "Complex I (NADH dehydrogenase)" = c("K00330","K00331","K00332","K00333","K00334","K00335","K00336","K00337","K00338","K00339"),
+  "Complex II (Succinate dehydrogenase)" = c("K00239","K00240","K00241","K00242"),
+  "Complex III (Cytochrome bc1)" = c("K00410","K00411","K00412"),
+  "Complex IV (Cytochrome c oxidase)" = c("K02256","K02261","K02262","K02263","K02264"),
+  "Complex V (F1Fo-ATPase)" = c("K02111","K02112","K02113","K02115","K02118","K02119","K02120","K02122")
+)
+MODULE2CAT <- c(
+  "Glycolysis"="Metabolisms","Entner-Doudoroff"="Metabolisms","Pentose phosphate (oxidative)"="Metabolisms",
+  "TCA cycle"="Metabolisms","Wood–Ljungdahl (acetyl-CoA)"="Metabolisms","Beta-oxidation (FA catabolism)"="Metabolisms",
+  "Lactate fermentation"="SCFA & alcohol","Ethanol fermentation"="SCFA & alcohol",
+  "Propionate (via acrylate/succinate)"="SCFA & alcohol","Butyrate (acetyl-CoA route)"="SCFA & alcohol",
+  "Complex I (NADH dehydrogenase)"="ETC complexes","Complex II (Succinate dehydrogenase)"="ETC complexes",
+  "Complex III (Cytochrome bc1)"="ETC complexes","Complex IV (Cytochrome c oxidase)"="ETC complexes",
+  "Complex V (F1Fo-ATPase)"="ETC complexes"
+)
+
+Ammonia_sets <- list(
+  "Urease (ureABC)"         = c("K01428","K01429","K01430"),
+  "DNRA (nrfAH) NO2→NH4⁺"   = c("K03385","K15876","K15877"),
+  "Glutamate dehydrogenase" = c("K00261","K00262","K00263")
+)
+
+Sulfur_KOs <- list(
+  "Assimilatory SO4→SO3"       = c("K00958","K00955"),
+  "APS reductase (aprAB)"       = c("K00394","K00395"),
+  "Dissimilatory sulfite red. (dsrAB)" = c("K11180","K11181"),
+  "S oxidation (sox cluster)"   = c("K17218","K17219","K17222","K17223","K17224","K17225","K17226")
+)
+MethHydro_KOs <- list(
+  "Methanogenesis (mcrABG)"     = c("K00399","K00401","K00402"),
+  "Methanotrophy pMMO (pmoABC)" = c("K10944","K10945","K10946"),
+  "Formate hydrogen lyase (FHL)"= c("K00125","K00126","K00127","K00128"),
+  "NiFe hydrogenase"            = c("K00436","K00437","K00438","K00439","K06131","K06133")
+)
+SCFA_KOs <- list(
+  "Acetate (pta-ackA)"           = c("K00625","K00925"),
+  "Propionate (succinate route)" = c("K01902","K01847","K01026"),
+  "Propionate (acrylate route)"  = c("K00016","K01782"),
+  "Butyrate (acetyl-CoA route)"  = c("K00929","K00930","K01034","K00626","K00074")
+)
+
+Stress_strict <- list(
+  "Oxidative stress (ROS detox)" = c("\\bkatg\\b|catalase[- ]?peroxidase",
+                                     "\\bsod[ab]\\b|superoxide dismutase",
+                                     "\\bahpc\\b","\\bahpf\\b","\\bohr\\b"),
+  "Osmoprotection (bet/pro/opu/proU)" = c("\\bbet[ta]\\b|glycine betaine",
+                                          "\\bpro[vwx]\\b|\\bprou\\b",
+                                          "\\bopu[abcdf]?\\b"),
+  "Biofilm/EPS (curated)" = c("\\bica[abcd]\\b","\\bpga[abcd]\\b","\\bpel[abcd]\\b","\\bpsl[abcdefghij]\\b")
+)
+Stress_min_hits <- c(
+  "Oxidative stress (ROS detox)" = 2,
+  "Osmoprotection (bet/pro/opu/proU)" = 2,
+  "Biofilm/EPS (curated)" = 2
+)
+
+HM_KOs <- list(
+  "Copper resistance (cop/cue)"        = c("K01533","K01534"),
+  "Arsenic resistance (ars operon)"    = c("K01551","K03741","K03325")
+)
+HM_text <- c(
+  "Zinc/Cadmium efflux (czc)" = "(\\bczc[abcdf]?\\b|zinc[- ]?efflux|cadmium[- ]?efflux)",
+  "Mercury resistance (mer)"  = "(\\bmer[abcrt]?\\b|mercury)",
+  "Quaternary ammonium (qac)" = "(\\bqac[a-z]*\\b|quaternary ammonium)"
+)
+
+# ---------- Utility builders ----------
+build_ko_tbl <- function(named_kos, mag_ko) {
+  km <- purrr::imap_dfr(named_kos, ~tibble(pathway=.y, KO=.x)) %>% distinct()
+  km %>%
+    inner_join(mag_ko, by="KO") %>%
+    distinct(sample, housing, pathway) %>%
+    mutate(present=TRUE)
+}
+
+build_text_panel_strict <- function(keyword_map, min_hits, long_file, mag_ko) {
+  if (!file.exists(long_file)) return(NULL)
+  long <- read.delim(long_file, sep="\t", header=TRUE, check.names=FALSE)
+  need <- c("sample","Preferred_name","Description")
+  if (!all(need %in% names(long))) return(NULL)
+  
+  long_txt <- long %>%
+    transmute(sample, text = stringr::str_to_lower(paste(Preferred_name, Description, sep=" | "))) %>%
+    distinct()
+  
+  res_list <- purrr::imap(keyword_map, function(regex_vec, pathway) {
+    hits <- purrr::map(regex_vec, ~ long_txt %>%
+                         filter(str_detect(text, .x)) %>%
+                         distinct(sample) %>% mutate(marker=.x)) %>% bind_rows()
+    if (nrow(hits)==0) tibble(sample=character(), n_markers=integer(), pathway=character())
+    else hits %>% count(sample, name="n_markers") %>% mutate(pathway=pathway)
+  }) %>% bind_rows()
+  
+  res_list %>%
+    left_join(mag_ko %>% distinct(sample, housing), by="sample") %>%
+    mutate(min_required = min_hits[pathway],
+           present = !is.na(n_markers) & n_markers >= min_required) %>%
+    select(sample, housing, pathway, present) %>%
+    distinct()
+}
+
+# ============================================================
+# MAIN RUNNER (process one infile & tag)
+# ============================================================
+run_pipeline <- function(infile, dataset_tag) {
+  
+  # ----- Load emapper -----
+  em_raw <- read.delim(infile, sep="\t", header=FALSE, quote="", comment.char="#",
+                       fill=TRUE, stringsAsFactors=FALSE, check.names=FALSE)
+  expected_cols <- c(
+    "sample","query_name","seed_ortholog","evalue","score","eggNOG_OGs","max_annot_lvl",
+    "COG_category","Description","Preferred_name","GOs","EC","KEGG_ko",
+    "KEGG_Pathway","KEGG_Module","KEGG_Reaction","KEGG_rclass","BRITE",
+    "KEGG_TC","CAZy","BiGG_Reaction","PFAMs"
+  )
+  if (ncol(em_raw) >= length(expected_cols)) {
+    em_raw <- em_raw[, seq_len(length(expected_cols)), drop=FALSE]
+  } else {
+    for (i in seq_len(length(expected_cols) - ncol(em_raw))) em_raw[[paste0("V_extra_", i)]] <- NA_character_
+    em_raw <- em_raw[, seq_len(length(expected_cols)), drop=FALSE]
+  }
+  names(em_raw) <- expected_cols
+  
+  em_long <- em_raw %>%
+    mutate(
+      housing = case_when(
+        str_detect(sample, regex("dust",   TRUE)) ~ "dust",
+        str_detect(sample, regex("litter|floor|cage", TRUE)) ~ "litter",
+        TRUE ~ "unknown"
+      ),
+      KO   = na_if(gsub("^ko:", "", KEGG_ko), ""),
+      CAZy = na_if(CAZy, "-")
+    )
+  write.table(em_long, file.path(out_dir, paste0(dataset_tag, "_emapper_long.tsv")),
+              sep="\t", row.names=FALSE, quote=FALSE)
+  
+  # ----- Unique KO/CAZy -----
+  mag_ko <- em_long %>% filter(!is.na(KO), KO != "") %>% distinct(sample, housing, KO)
+  mag_cazy <- em_long %>% filter(!is.na(CAZy), CAZy != "-") %>% distinct(sample, housing, CAZy)
+  write.table(mag_ko,   file.path(out_dir, paste0(dataset_tag, "_mag_ko_unique.tsv")),   sep="\t", row.names=FALSE, quote=FALSE)
+  write.table(mag_cazy, file.path(out_dir, paste0(dataset_tag, "_mag_cazy_unique.tsv")), sep="\t", row.names=FALSE, quote=FALSE)
+  
+  # ----- Tax labels & ordering -----
+  lab_df <- mag_ko %>%
+    distinct(sample) %>%
+    left_join(tax_clean, by="sample") %>%
+    mutate(tax_label_raw = coalesce(tax_label_raw, sample)) %>%
+    group_by(tax_label_raw) %>%
+    mutate(sample_label = if (dplyr::n() > 1) paste0(tax_label_raw, " (", dplyr::row_number(), ")") else tax_label_raw) %>%
+    ungroup() %>%
+    select(sample, sample_label)
+  lab_map <- stats::setNames(lab_df$sample_label, lab_df$sample)
+  
+  sample_order <- mag_ko %>%
+    distinct(sample, housing) %>%
+    left_join(lab_df, by="sample") %>%
+    arrange(housing, sample_label) %>%
+    pull(sample)
+  
+  # ----- Module completeness -----
+  comp_tbl <- purrr::map_df(names(KOSETS), function(mod) {
+    kos <- unique(KOSETS[[mod]])
+    mag_ko %>%
+      filter(KO %in% kos) %>%
+      group_by(sample, housing) %>%
+      summarise(found = n_distinct(KO), .groups="drop") %>%
+      mutate(module = mod)
+  }) %>%
+    tidyr::complete(sample = unique(mag_ko$sample),
+                    housing = unique(mag_ko$housing),
+                    module  = names(KOSETS),
+                    fill = list(found = 0)) %>%
+    mutate(
+      total = sapply(as.character(module), function(m) length(unique(KOSETS[[m]]))),
+      completeness = pmin(100, 100 * found / total),
+      category = MODULE2CAT[as.character(module)]
+    )
+  
+  heat_dat <- comp_tbl %>%
+    filter(category %in% c("Metabolisms","ETC complexes")) %>%
+    mutate(sample = factor(sample, levels = rev(sample_order)),
+           category = factor(category, levels = c("Metabolisms","ETC complexes")))
+  fig_h <- dyn_h(nlevels(heat_dat$sample))
+  p_combined <- ggplot(heat_dat, aes(x=module, y=sample, fill=completeness/100)) +
+    geom_tile() +
+    facet_grid(. ~ category, scales="free_x", space="free_x") +
+    scale_fill_gradientn(colours=c("#08306b","#2171b5","#6baed6","#c7e9b4","#ffffe5"),
+                         limits=c(0,1), breaks=c(0,.25,.5,.75,1),
+                         labels=c("0","25","50","75","100"),
+                         name="Completeness (%)") +
+    scale_x_discrete(labels = wrap_x) +
+    scale_y_discrete(labels = function(x) lab_trunc(lab_map[as.character(x)])) +
+    labs(x=NULL, y=NULL, title=paste("Module completeness —", dataset_tag)) +
+    theme_minimal(base_size=10) +
+    theme(panel.grid=element_blank(),
+          axis.text.x=element_text(angle=45, hjust=1, vjust=1, size=8, lineheight=0.95),
+          axis.text.y=element_text(size=8),
+          strip.text=element_text(face="bold"))
+  ggsave(file.path(out_dir, paste0("01_module_completeness_", dataset_tag, ".png")),
+         p_combined, width=14, height=fig_h, dpi=600, bg="white")
+  write.table(comp_tbl, file.path(out_dir, paste0("module_completeness_", dataset_tag, ".tsv")),
+              sep="\t", row.names=FALSE, quote=FALSE)
+  
+  # ----- CAZy presence -----
+  cazy_clean <- mag_cazy %>%
+    mutate(CAZy = str_trim(CAZy)) %>%
+    filter(str_detect(CAZy, "^(GH|GT|PL|CE|CBM)\\d+")) %>%
+    distinct(sample, housing, CAZy) %>%
+    mutate(class = str_extract(CAZy, "^(GH|GT|PL|CE|CBM)"))
+  topN <- 80
+  top_fams <- cazy_clean %>% count(CAZy, sort=TRUE) %>% slice_head(n=topN) %>% pull(CAZy)
+  cazy_plot <- cazy_clean %>%
+    filter(CAZy %in% top_fams) %>%
+    mutate(sample=factor(sample, levels=rev(sample_order)),
+           class=factor(class, levels=c("GH","GT","PL","CE","CBM")))
+  fig_h_cazy <- dyn_h(nlevels(cazy_plot$sample))
+  cazy_class_labels <- c(
+    "GH"="Glycoside hydrolases (GH)",
+    "GT"="Glycosyltransferases (GT)",
+    "PL"="Polysaccharide lyases (PL)",
+    "CE"="Carbohydrate esterases (CE)",
+    "CBM"="Carbohydrate-binding modules (CBM)"
+  )
+  p_cazy <- ggplot(cazy_plot, aes(x=CAZy, y=sample, fill="Present")) +
+    geom_tile() +
+    facet_grid(. ~ class, scales="free_x", space="free_x",
+               labeller = as_labeller(cazy_class_labels)) +
+    scale_fill_manual(values=c("Present"="#2E7D32"), guide="none") +
+    labs(x=NULL, y=NULL, title=paste("CAZy families (presence) —", dataset_tag)) +
+    theme_minimal(base_size=8) +
+    theme(panel.grid=element_blank(),
+          axis.text.x=element_text(angle=60, hjust=1, vjust=1, size=6),
+          axis.text.y=element_text(size=6),
+          strip.text=element_text(face="bold")) +
+    scale_y_discrete(labels = function(x) lab_trunc(lab_map[as.character(x)]))
+  ggsave(file.path(out_dir, paste0("02_presence_cazy_tiles_", dataset_tag, ".png")),
+         p_cazy, width=15, height=fig_h_cazy, dpi=300, bg="white")
+  
+  # ----- Ammonia (KO + ureDEFG text) -----
+  ammonia_map <- purrr::imap_dfr(Ammonia_sets, ~tibble(pathway=.y, KO=.x)) %>% distinct()
+  ammonia_tbl_KO <- ammonia_map %>% inner_join(mag_ko, by="KO") %>%
+    distinct(sample, housing, pathway) %>% mutate(present=TRUE)
+  long_file <- file.path(out_dir, paste0(dataset_tag, "_emapper_long.tsv"))
+  present_from_text <- tibble(sample=character(), housing=character(), pathway=character(), present=logical())
+  if (file.exists(long_file)) {
+    long_df <- read.delim(long_file, sep="\t", header=TRUE, check.names=FALSE)
+    if (all(c("sample","Preferred_name","Description") %in% names(long_df))) {
+      present_from_text <- long_df %>%
+        transmute(sample, text = tolower(paste(Preferred_name, Description, sep=" | "))) %>%
+        filter(str_detect(text, "\\bure[defg]\\b|urease accessory")) %>%
+        distinct(sample) %>%
+        left_join(mag_ko %>% distinct(sample, housing), by="sample") %>%
+        mutate(pathway = "Urease accessory (ureDEFG)", present = TRUE) %>%
+        distinct(sample, housing, pathway, present)
+    }
+  }
+  ammonia_tbl <- bind_rows(ammonia_tbl_KO, present_from_text) %>% distinct()
+  ammonia_all <- tidyr::expand_grid(
+    sample  = unique(mag_ko$sample),
+    housing = unique(mag_ko$housing),
+    pathway = unique(c(names(Ammonia_sets), "Urease accessory (ureDEFG)"))
+  ) %>%
+    left_join(ammonia_tbl, by=c("sample","housing","pathway")) %>%
+    mutate(present = replace_na(present, FALSE),
+           sample  = factor(sample, levels = rev(sample_order)))
+  
+  # ----- Sulfur / Methane-Hydrogen / SCFA (KO) -----
+  sulfur_tbl    <- build_ko_tbl(Sulfur_KOs,    mag_ko)
+  methhydro_tbl <- build_ko_tbl(MethHydro_KOs, mag_ko)
+  scfa_tbl      <- build_ko_tbl(SCFA_KOs,      mag_ko)
+  
+  # ----- Stress (strict) -----
+  stress_strict_all <- build_text_panel_strict(Stress_strict, Stress_min_hits, long_file, mag_ko)
+  if (is.null(stress_strict_all)) stop("Strict stress panel failed to build — check long_file and columns.")
+  
+  # ----- HM/Disinfectant (KO + text merged) -----
+  hm_tbl <- build_ko_tbl(HM_KOs, mag_ko)
+  hm_txt_tbl <- {
+    if (!file.exists(long_file)) tibble(sample=character(), housing=character(), pathway=character(), present=logical()) else {
+      long_df <- read.delim(long_file, sep="\t", header=TRUE, check.names=FALSE) %>%
+        transmute(sample, text = stringr::str_to_lower(paste(Preferred_name, Description, sep=" | "))) %>%
+        distinct() %>%
+        left_join(mag_ko %>% distinct(sample, housing), by="sample")
+      purrr::imap_dfr(HM_text, function(rx, pathway){
+        long_df %>%
+          filter(str_detect(text, rx)) %>%
+          distinct(sample, housing) %>%
+          mutate(pathway=pathway, present=TRUE)
+      }) %>% distinct()
+    }
+  }
+  hm_all_merge <- bind_rows(
+    hm_tbl     %>% transmute(sample, housing, pathway, present),
+    hm_txt_tbl %>% transmute(sample, housing, pathway, present)
+  ) %>%
+    group_by(sample, housing, pathway) %>%
+    summarise(present = any(present), .groups="drop") %>%
+    mutate(category = "Heavy metal/Disinfectant resistance")
+  
+  # ----- Merge categories, filter, de-dup, plot -----
+  sulfur_tbl_merge    <- sulfur_tbl    %>% transmute(sample, housing, pathway, category="Sulfur metabolism",               present)
+  methhydro_tbl_merge <- methhydro_tbl %>% transmute(sample, housing, pathway, category="Methane/Hydrogen metabolism",     present)
+  scfa_tbl_merge      <- scfa_tbl      %>% transmute(sample, housing, pathway, category="SCFA pathways",                   present)
+  ammonia_tbl_merge   <- ammonia_all   %>% transmute(sample, housing, pathway, category="Ammonia potential",               present)
+  stress_tbl_merge    <- stress_strict_all %>% transmute(sample, housing, pathway, category="Stress/survival (strict)",    present)
+  
+  all_tbl <- bind_rows(
+    sulfur_tbl_merge,
+    methhydro_tbl_merge,
+    scfa_tbl_merge,
+    stress_tbl_merge,
+    hm_all_merge,
+    ammonia_tbl_merge
+  ) %>% distinct(sample, housing, pathway, category, present)
+  
+  path_cat_counts <- all_tbl %>%
+    count(pathway, category, wt = as.integer(present), name="n_hits")
+  keep_pathways <- path_cat_counts %>%
+    group_by(pathway) %>%
+    summarise(total_hits = sum(n_hits), .groups="drop") %>%
+    filter(total_hits > 0) %>%
+    pull(pathway)
+  all_tbl_filt <- all_tbl %>% filter(pathway %in% keep_pathways)
+  
+  cat_priority <- c(
+    "Ammonia potential",
+    "SCFA pathways",
+    "Sulfur metabolism",
+    "Methane/Hydrogen metabolism",
+    "Stress/survival (strict)",
+    "Heavy metal/Disinfectant resistance"
+  )
+  
+  path_cat_choice <- path_cat_counts %>%
+    filter(pathway %in% keep_pathways) %>%
+    mutate(cat_rank = match(category, cat_priority)) %>%
+    arrange(pathway, desc(n_hits), cat_rank) %>%
+    group_by(pathway) %>% slice_head(n=1) %>% ungroup() %>%
+    select(pathway, category_chosen = category)
+  
+  all_tbl_unique <- all_tbl_filt %>%
+    inner_join(path_cat_choice, by="pathway") %>%
+    filter(category == category_chosen) %>%
+    select(sample, housing, pathway, category, present)
+  
+  kept_categories <- unique(all_tbl_unique$category)
+  kept_pathways   <- unique(all_tbl_unique$pathway)
+  all_complete_clean <- tidyr::expand_grid(
+    sample  = unique(mag_ko$sample),
+    housing = unique(mag_ko$housing),
+    pathway = kept_pathways,
+    category= kept_categories
+  ) %>%
+    left_join(all_tbl_unique, by=c("sample","housing","pathway","category")) %>%
+    mutate(
+      present  = replace_na(present, FALSE),
+      category = factor(category, levels = cat_priority[cat_priority %in% kept_categories]),
+      sample   = factor(sample, levels = rev(sample_order))
+    ) %>%
+    semi_join(path_cat_choice %>% rename(category = category_chosen), by=c("pathway","category"))
+  
+  fig_h_all <- dyn_h(nlevels(all_complete_clean$sample))
+  p_all <- ggplot(all_complete_clean,
+                  aes(x=pathway, y=sample, fill=ifelse(present,"Present","Absent"))) +
+    geom_tile() +
+    facet_grid(. ~ category, scales="free_x", space="free_x") +
+    scale_fill_manual(values=c("Absent"="white","Present"="#2E7D32"), name="") +
+    labs(x=NULL, y=NULL, title=paste("Functional potential across MAGs —", dataset_tag)) +
+    theme_minimal(base_size=9) +
+    theme(panel.grid=element_blank(),
+          axis.text.x=element_text(angle=45, hjust=1, vjust=1, size=7),
+          axis.text.y=element_text(size=6),
+          strip.text=element_text(face="bold"),
+          legend.position="left") +
+    scale_y_discrete(labels = function(x) lab_trunc(lab_map[as.character(x)]))
+  ggsave(file.path(out_dir, paste0("13_all_panels_functional_tiles_WITH_AMMONIA_", dataset_tag, ".png")),
+         p_all, width=18, height=fig_h_all, dpi=300, bg="white")
+  
+  readr::write_tsv(
+    all_complete_clean %>%
+      transmute(sample, housing, category, pathway, present = as.integer(present)),
+    file.path(out_dir, paste0("13_all_panels_functional_matrix_WITH_AMMONIA_", dataset_tag, ".tsv"))
+  )
+  readr::write_tsv(
+    all_complete_clean %>%
+      filter(present) %>%
+      count(category, pathway, name="n_MAGs_with_pathway") %>%
+      arrange(category, desc(n_MAGs_with_pathway)),
+    file.path(out_dir, paste0("13_all_panels_functional_summary_WITH_AMMONIA_", dataset_tag, ".tsv"))
+  )
+  
+  # ----- Prevalence & barplot -----
+  prev_tbl <- all_complete_clean %>%
+    group_by(category, pathway, housing) %>%
+    summarise(n_pos = sum(present), n_tot = n_distinct(sample),
+              prevalence = round(100 * n_pos / n_tot, 1), .groups="drop") %>%
+    arrange(category, desc(prevalence))
+  readr::write_tsv(prev_tbl,
+                   file.path(out_dir, paste0("14_prevalence_table_", dataset_tag, ".tsv")))
+  
+  p_prev <- prev_tbl %>%
+    ggplot(aes(x=reorder(pathway, prevalence), y=prevalence, fill=housing)) +
+    geom_col(position="dodge") +
+    facet_wrap(~category, scales="free_y") +
+    coord_flip() +
+    labs(x=NULL, y="Prevalence (% of MAGs)", title=paste("Functional pathway prevalence —", dataset_tag)) +
+    scale_fill_manual(values=c("dust"="#1B9E77","litter"="#D95F02")) +
+    theme_minimal(base_size=9) +
+    theme(strip.text=element_text(face="bold"))
+  ggsave(file.path(out_dir, paste0("14_prevalence_barplot_", dataset_tag, ".png")),
+         p_prev, width=12, height=8, dpi=300, bg="white")
+  
+  message("Finished: ", dataset_tag, " | outputs in ", out_dir)
+  
+  # Return for optional downstream use
+  invisible(list(all_complete_clean=all_complete_clean,
+                 prev_tbl=prev_tbl,
+                 lab_map=lab_map))
+}
+
+# ============================================================
+# RUN BOTH DATASETS
+# ============================================================
+dust_res   <- run_pipeline(dust_infile,   "dust")
+litter_res <- run_pipeline(litter_infile, "litter")
